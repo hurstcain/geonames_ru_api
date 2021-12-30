@@ -1,308 +1,274 @@
 import socket
 import json
 import re
-import threading
 import urllib.parse
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from db_config import dbname, user, password, host
+from time_zones import time_zones
 
 
-# Из файла с географическими объектами выбирает только населенные пункты
-# и добавляет информацию о них в список, а затем возвращает его
-def init_city_list():
-    f = open('RU.txt', 'r', encoding='utf-8')
-    city_list = []
-    # id столбца feature class, в котором содержится
-    # класс географического объекта
-    feature_class_id = 6
-    # Класс географического объекта, который обозначает населенный пункт
-    feature_class = 'P'
+class Server:
+    def __init__(self, ip: str, port: int) -> None:
+        # ip - ip адрес сервера
+        # port - порт сервера
+        # server - сокет сервера
 
-    for string in f:
-        city_info_list = string[:-1].split('\t')
-        if city_info_list[feature_class_id] == feature_class:
-            city_list.append(city_info_list)
+        self.__ip: str = ip
+        self.__port: int = port
+        self.__server: socket.socket = self.create_server()
 
-    f.close()
+    @property
+    def ip(self) -> str:
+        return self.__ip
 
-    return city_list
+    @property
+    def port(self) -> int:
+        return self.__port
 
+    def create_server(self) -> socket.socket:
+        # Возвращает сокет сервера
 
-# Список с городами и их информацией
-CITY_LIST = init_city_list()
+        return socket.create_server((self.__ip, self.__port))
 
+    def close_server(self) -> None:
+        # Закрывает сервер
 
-# Запускает сервер
-def start_server():
-    server = socket.create_server(('127.0.0.1', 8000))
-    try:
-        server.listen()
-        print('Server is running')
-        while True:
-            client_socket, client_address = server.accept()
-            # Создаем и запускаем поток, который будет обрабатывать конкретный запрос
-            client_handler = threading.Thread(target=process_request, args=(client_socket,))
-            client_handler.start()
-    except KeyboardInterrupt:
         print('Closing server...')
-        server.close()
+        self.__server.close()
 
+    def start_server(self) -> None:
+        # Запускает сервер, подключает клиентов, передает запросы в обработку
+        # и возвращает ответ клиенту
 
-# Обрабатывает запрос клиента
-def process_request(client_socket):
-    # Содержимое запроса
-    data = client_socket.recv(1024).decode('utf-8')
-    if data:
-        print('Processing a request...')
-        # Ответ сервера на запрос
-        content = get_response(data)
-        # Передаем ответ клиенту
-        client_socket.send(content)
-    # Отключаем клиентский сокет
-    client_socket.shutdown(socket.SHUT_WR)
+        try:
+            self.__server.listen()
+            print('Server is running')
 
+            while True:
+                client_socket, client_address = self.__server.accept()
+                print(f'{client_address} connected')
+                # Получаем запрос клиента
+                data: str = client_socket.recv(1024).decode('utf-8')
 
-# Возвращает ответ сервера на запрос клиента
-def get_response(data):
-    HDRS = 'HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n'
-    HDRS_404 = 'HTTP/1.1 404 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n'
+                if data:
+                    print(f"Processing {client_address} client's request...")
+                    # Ответ сервера на запрос
+                    content: bytes = self.process_request(data)
+                    # Передаем ответ клиенту
+                    client_socket.send(content)
 
-    request = urllib.parse.unquote(data.split()[1][1:])
-    response = check_request(request)
-    if response is None:
-        return (HDRS_404 + 'Error. Unable to process the request').encode('utf-8')
-    else:
-        return (HDRS + convert_to_json(response)).encode('utf-8')
+                # Отключаем клиентский сокет
+                client_socket.shutdown(socket.SHUT_WR)
 
+        except KeyboardInterrupt:
+            self.close_server()
 
-# Определяет вид запроса и в зависимости от вида запроса возвращает ответ
-def check_request(request):
-    if re.fullmatch(r'[0-9a-zA-Zа-яА-ЯёЁ -]+$', request):
-        return get_tips(request)
-    elif re.fullmatch(r'id/[0-9]+$', request):
-        return get_city_info_by_id(request[3:])
-    elif re.fullmatch(r'name/[0-9a-zA-Zа-яА-ЯёЁ -]+$', request):
-        return get_city_info_by_name(request[5:])
-    elif re.fullmatch(r'cities/[0-9]+$', request):
-        return get_cities_list(int(request[7:]))
-    elif re.fullmatch(r'[?]city1=[0-9a-zA-Zа-яА-ЯёЁ -]+&city2=[0-9a-zA-Zа-яА-ЯёЁ -]+$', request):
-        return get_information_about_two_cities(request)
-    else:
-        return None
+    def process_request(self, data: str) -> bytes:
+        # Обрабатывает запрос клиента и в зависимости от результата возвращает ответ
+        # data - http запрос клиента
+        # HDRS, HDRS_404 - заголовки html страницы
+        # request - запрос клиента, например, '/code/p/name/санкт-петербург'
+        # response - ответ сервера, если возвращается None, то значит запрос
+        # был сформирован некорректно
 
+        HDRS: str = 'HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n'
+        HDRS_404: str = 'HTTP/1.1 404 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n'
 
-# Возвращает список городов, название которых начинается
-# на или совпадает со значением переменной first_part_of_name
-# first_part_of_name - часть названия города, введенная пользователем
-def get_tips(first_part_of_name):
-    # id столбца alternatenames, в котором содержатся
-    # альтернативные названия городов
-    id = 3
-    cities_list = []
+        request: str = urllib.parse.unquote(data.split()[1][1:]).lower()
 
-    for city_info_list in CITY_LIST:
-        # Список с альтернативными названиями текущего города
-        alternative_names_list = city_info_list[id].split(',')
-        for alternative_name in alternative_names_list:
-            if re.match(first_part_of_name.lower(), alternative_name.lower()):
-                cities_list.append(alternative_name)
-
-    return list(set(cities_list))
-
-
-# Возвращает информацию о городе по id
-def get_city_info_by_id(id):
-    city_info = None
-
-    for city_info_list in CITY_LIST:
-        if city_info_list[0] == id:
-            city_info = city_info_list
-            break
-
-    if city_info:
-        return put_data_to_dict(city_info)
-    else:
-        return 'There is no city with the entered id'
-
-
-# Записывает информацию о городе в словарь
-def put_data_to_dict(city_info):
-    # Ключи словаря
-    dict_keys = ['geonameid', 'name', 'asciiname', 'alternatenames', 'latitude',
-                    'longitude', 'feature class', 'feature code', 'country code',
-                    'cc2', 'admin1 code', 'admin2 code', 'admin3 code', 'admin4 code',
-                    'population', 'elevation', 'dem', 'timezone', 'modification date']
-    # Словарь, содержащий информацию о городе
-    dict_with_city_info = {}
-
-    for i in range(0, len(dict_keys)):
-        if city_info[i]:
-            dict_with_city_info.update({dict_keys[i]: city_info[i]})
+        if request[:5] == 'code/':
+            if request[5] in ['a', 'h', 'l', 'p', 'r', 's', 't', 'u', 'v']:
+                response: list = self.check_request(request[7:], request[5])
+            else:
+                response = None
         else:
-            dict_with_city_info.update({dict_keys[i]: 'no info'})
+            response: list = self.check_request(request)
 
-    return dict_with_city_info
+        if response is None:
+            return (HDRS_404 + 'Error. Unable to process the request').encode('utf-8')
+        else:
+            return (HDRS + self.convert_to_json(response)).encode('utf-8')
 
+    def check_request(self, request: str, code: str = '') -> list:
+        # Определяет вид запроса клиента, формирует sql запросы к базе данных
+        # Возвращает результат SELECT запроса к бд в виде списка
+        # request - get запрос клиента
+        # code - код географического объекта, если не указан в запросе, то будет равен
+        # пустой строке
+        # sql_query - sql запрос
+        # data - кортеж с данными, которые будут переданы в динамический запрос к бд
 
-# Возвращает список с информацией о городах
-def get_cities_list(number_of_cities):
-    cities_list = []
+        sql_query: str = ''
+        data: tuple = ()
 
-    if number_of_cities > len(CITY_LIST):
-        number_of_cities = len(CITY_LIST)
+        if not code:
+            if re.fullmatch(r'id/[0-9]+$', request):
+                # Поиск по id, осуществляется, если не указан код географического объекта
+                # Запрос выглядит как id/{id географического объекта}
 
-    for i in range(0, number_of_cities):
-        cities_list.append(put_data_to_dict(CITY_LIST[i]))
+                object_id: int = int(request[3:])
+                sql_query = 'SELECT * FROM geoname_ru WHERE geonameid = %s'
+                data = (object_id,)
 
-    return cities_list
+            elif re.fullmatch(r'compare/id[?]object1=[0-9]+&object2=[0-9]+$', request):
+                # Возвращает список с информацией о двух географических объектах
+                # и о различиях между ними (какой севернее и разность часовых поясов)
+                # В данном запросе указывается id объекта
+                # Примеры обрабатываемых запросов:
+                # compare/id?object1=453489&object2=467263
 
+                id_geo_object1: int = int(
+                    re.search(r'[=][0-9]+[&]', request).group(0).replace("=", "").replace("&", ""))
+                id_geo_object2: int = int(re.search(r'[=][0-9]+$', request).group(0).replace("=", ""))
 
-# Возвращает словарь с информацией о двух городах
-# и о различиях между ними (какой город севернее и разность часовых поясов)
-def get_information_about_two_cities(request):
-    # Выделяем названия городов из запроса
-    city1 = re.search(r'[=][0-9a-zA-Zа-яА-ЯёЁ -]+[&]', request).group(0).replace("=", "").replace("&", "")
-    city2 = re.search(r'[=][0-9a-zA-Zа-яА-ЯёЁ -]+$', request).group(0).replace("=", "")
-    # Получаем информацию о городах
-    city1_info = get_city_info_by_name(city1)
-    city2_info = get_city_info_by_name(city2)
+                sql_query = 'SELECT * FROM geoname_ru WHERE geonameid = %s'
 
-    if city1_info and city2_info:
-        # Получаем различия двух городов
-        diff = get_differences(city1_info, city2_info)
+                data = (id_geo_object1,)
+                geo_object1 = self.process_sql_query(sql_query, data)
 
-        cities_info = {}
-        cities_info.update({
-            'city1': city1_info,
-            'city2': city2_info,
-            'differences': diff
-        })
-        return cities_info
-    else:
-        return 'An unknown city was specified in the request'
+                data = (id_geo_object2,)
+                geo_object2 = self.process_sql_query(sql_query, data)
 
+                return self.get_information_about_two_geo_objects(geo_object1, geo_object2)
 
-# Возвращает информацию о городе по его названию
-# Если существует несколько городов с таким названием, то
-# выбирается город с наибольшим населением
-def get_city_info_by_name(name):
-    # id столбца alternatenames, в котором содержатся
-    # альтернативные названия городов
-    id = 3
-    cities_list = []
+        if re.fullmatch(r'tips/[0-9a-zа-яё -]+$', request):
+            # Вывод подсказок для названий географических объектов
+            # Примеры обрабатываемых запросов:
+            # tips/моск
+            # code/h/tips/моск
 
-    for city_info_list in CITY_LIST:
-        # Список с альтернативными названиями текущего города
-        alternative_names_list = city_info_list[id].lower().split(',')
-        if name.lower() in alternative_names_list:
-            cities_list.append(put_data_to_dict(city_info_list))
+            part_of_name: str = '%' + request[5:] + '%'
 
-    if cities_list:
-        return choose_city(cities_list)
-    else:
-        return None
+            if code:
+                sql_query = 'SELECT DISTINCT alternate_name, geonameid, feature_class, population FROM (' \
+                            'SELECT *, UNNEST(alternatenames) AS alternate_name FROM geoname_ru ' \
+                            'WHERE feature_class ILIKE %s) AS alternate_names ' \
+                            'WHERE alternate_name ILIKE %s ORDER BY population DESC, alternate_name'
+                data = (code, part_of_name)
+            else:
+                sql_query = 'SELECT DISTINCT alternate_name, geonameid, feature_class, population FROM (' \
+                            'SELECT *, UNNEST(alternatenames) AS alternate_name FROM geoname_ru ' \
+                            ') AS alternate_names ' \
+                            'WHERE alternate_name ILIKE %s ORDER BY population DESC, alternate_name'
+                data = (part_of_name,)
 
+        elif re.fullmatch(r'all/[0-9]+$', request):
+            # Возвращает указанное количество первых записей таблицы
+            # Примеры обрабатываемых запросов:
+            # all/10
+            # code/h/all/5
 
-# Из списка городов возвращает город с наибольшим населением
-def choose_city(cities_list):
-    max_population = int(cities_list[0].get('population'))
-    id = 0
+            limit: int = int(request[4:])
 
-    for i in range(1, len(cities_list)):
-        if int(cities_list[i].get('population')) > max_population:
-            max_population = int(cities_list[i].get('population'))
-            id = i
+            if code:
+                sql_query = 'SELECT * FROM geoname_ru WHERE feature_class ILIKE %s LIMIT %s'
+                data = (code, limit)
+            else:
+                sql_query = 'SELECT * FROM geoname_ru LIMIT %s'
+                data = (limit,)
 
-    return cities_list[id]
+        elif re.fullmatch(r'all$', request):
+            # Возвращает все записи
+            # Примеры обрабатываемых запросов:
+            # all
+            # code/h/all
 
+            if code:
+                sql_query = 'SELECT * FROM geoname_ru WHERE feature_class ILIKE %s'
+                data = (code,)
+            else:
+                sql_query = 'SELECT * FROM geoname_ru'
 
-# Возвращает словарь с различиями двух городов
-def get_differences(city1, city2):
-    differences = {'differences': {}}
-    time_zones = get_time_zones()
-    city1_latitude = city1.get('latitude')
-    city2_latitude = city2.get('latitude')
+        elif re.fullmatch(r'name/[0-9a-zа-яё -]+$', request):
+            # Производит поиск географисеского объекта по имени
+            # Если находятся несколько, то сначала выводятся объекты с наибольшим населением
+            # Примеры обрабатываемых запросов:
+            # name/питер
+            # code/p/name/москва
 
-    # Определяем самый северный город
-    if float(city1_latitude) > float(city2_latitude):
-        differences['differences'].update({
-            'The northernmost city': city1.get('name')
-        })
-    elif float(city1_latitude) < float(city2_latitude):
-        differences['differences'].update({
-            'The northernmost city': city2.get('name')
-        })
-    else:
-        differences['differences'].update({
-            'The northernmost city': "Can't say for sure. These two cities have the same latitude"
-        })
+            name: str = request[5:]
 
-    # Определяем различие временных зон
-    time_zone_diff = abs(time_zones.get(city1.get('timezone')) - time_zones.get(city2.get('timezone')))
-    differences['differences'].update({
-        'Timezones differences': time_zone_diff
-    })
+            if code:
+                sql_query = 'SELECT * FROM geoname_ru WHERE EXISTS ( ' \
+                            'SELECT * FROM UNNEST(alternatenames) AS alternatename WHERE alternatename ILIKE %s ) ' \
+                            'AND feature_class ILIKE %s ORDER BY population DESC, geoname_ru.name'
+                data = (name, code)
+            else:
+                sql_query = 'SELECT * FROM geoname_ru WHERE EXISTS ( ' \
+                            'SELECT * FROM UNNEST(alternatenames) AS alternatename WHERE alternatename ILIKE %s ) ' \
+                            'ORDER BY population DESC, geoname_ru.name'
+                data = (name,)
 
-    return differences
+        return self.process_sql_query(sql_query, data)
 
+    @staticmethod
+    def process_sql_query(query: str, data: tuple) -> list:
+        # Коннектится к базе данных, выполняет запрос и возвращает результат запроса
+        # query - запрос к бд
+        # data - кортеж с данными, которые будут переданы в динамический запрос к бд
+        # response - список с результатом выполнения SELECT запроса
 
-# Возвращает словарь с названиями временных зон и их GMT
-def get_time_zones():
-    time_zones = {
-        'Europe/Kiev': 2.0,
-        'Asia/Vladivostok': 10.0,
-        'Asia/Tbilisi': 4.0,
-        'Europe/Simferopol': 3.0,
-        'Asia/Krasnoyarsk': 7.0,
-        'Asia/Sakhalin': 11.0,
-        'Asia/Anadyr': 12.0,
-        'Europe/Volgograd': 3.0,
-        'Asia/Srednekolymsk': 11.0,
-        'Asia/Qyzylorda': 5.0,
-        'Asia/Shanghai': 8.0,
-        'Asia/Aqtobe': 5.0,
-        'Europe/Samara': 4.0,
-        'Asia/Omsk': 6.0,
-        'Asia/Novokuznetsk': 7.0,
-        'Asia/Ulaanbaatar': 8.0,
-        'Asia/Barnaul': 7.0,
-        'Asia/Tokyo': 9.0,
-        'Europe/Warsaw': 1.0,
-        'Europe/Paris': 1.0,
-        'Asia/Hovd': 7.0,
-        'Europe/Helsinki': 2.0,
-        'Europe/Saratov': 4.0,
-        'Europe/Oslo': 1.0,
-        'Asia/Chita': 9.0,
-        'Asia/Magadan': 11.0,
-        'Asia/Tashkent': 5.0,
-        'Asia/Ashgabat': 5.0,
-        'Asia/Yakutsk': 9.0,
-        'Europe/Riga': 2.0,
-        'Europe/Kirov': 3.0,
-        'Europe/Monaco': 1.0,
-        'Asia/Baku': 4.0,
-        'Europe/Zaporozhye': 2.0,
-        'Asia/Tomsk': 7.0,
-        'Asia/Novosibirsk': 7.0,
-        'Asia/Khandyga': 9.0,
-        'Europe/Vilnius': 2.0,
-        'Europe/Kaliningrad': 2.0,
-        'Europe/Astrakhan': 4.0,
-        'Asia/Yekaterinburg': 5.0,
-        'Asia/Ust-Nera': 10.0,
-        'Asia/Irkutsk': 8.0,
-        'Europe/Minsk': 3.0,
-        'Asia/Kamchatka': 12.0,
-        'Europe/Moscow': 3.0,
-        'Europe/Ulyanovsk': 4.0,
-    }
+        if query:
+            conn = psycopg2.connect(dbname=dbname, user=user,
+                                    password=password, host=host)
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute(query, data)
+            response: list = cursor.fetchall()
+            cursor.close()
+            conn.close()
 
-    return time_zones
+            return response
 
+    @staticmethod
+    def get_information_about_two_geo_objects(obj1: list, obj2: list) -> list:
+        # Принимает на вход два списка:
+        # obj1 - информация о первом географическом объекте
+        # obj2 - информация о втором географическом объекте
+        # Определяет различия временных зон и какой объект находится севернее
+        # differences: dict - словарь c различиями
+        # obj1_latitude: float - широта первого объекта
+        # obj2_latitude: float - широта второго объекта
+        # obj1_time_zone: int - часовой пояс первого объекта
+        # obj2_time_zone: int - часовой пояс второго объекта
+        # Возвращает список со словарями: информацию о двух географических объектах и их различия
+        # Если id города указан неверно, то запрос не обрабатывается
 
-# Преобразовывает данные в формат JSON
-def convert_to_json(data):
-    return json.dumps(data, indent=4, ensure_ascii=False)
+        if obj1 and obj2:
+            differences: dict = {}
+            obj1_latitude: float = float(obj1[0]['latitude'])
+            obj2_latitude: float = float(obj2[0]['latitude'])
+            obj1_time_zone: int = time_zones[obj1[0]['timezone']]
+            obj2_time_zone: int = time_zones[obj2[0]['timezone']]
+
+            # Определяем самый северный город
+            if obj1_latitude > obj2_latitude:
+                differences['The northernmost geo object'] = obj1[0]['name']
+            elif obj1_latitude < obj2_latitude:
+                differences['The northernmost geo object'] = obj2[0]['name']
+            else:
+                differences['The northernmost geo object'] = \
+                    "Can't say for sure. These two geo objects have the same latitude"
+
+            # Определяем различие временных зон
+            time_zone_diff: int = abs(obj1_time_zone - obj2_time_zone)
+            differences['Timezones differences'] = time_zone_diff
+
+            return [
+                {'geo object 1': obj1[0]},
+                {'geo object 2': obj2[0]},
+                {'differences': differences}
+            ]
+        else:
+            return ['An unknown geo object was specified in the request']
+
+    @staticmethod
+    def convert_to_json(data: list):
+        # Конвертирует список data в формат JSON
+
+        return json.dumps(data, indent=4, ensure_ascii=False, default=str)
 
 
 if __name__ == '__main__':
-    start_server()
+    server = Server('127.0.0.1', 8000)
+    server.start_server()
